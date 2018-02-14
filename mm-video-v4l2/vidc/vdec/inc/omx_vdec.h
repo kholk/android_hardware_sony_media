@@ -56,6 +56,8 @@ IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <unordered_map>
 #include <media/msm_media_info.h>
 
+#include <linux/ion.h>
+
 #include "C2DColorConverter.h"
 
 static ptrdiff_t x;
@@ -108,7 +110,7 @@ extern "C" {
 #include "OMX_VideoExt.h"
 #include "OMX_IndexExt.h"
 #include "qc_omx_component.h"
-#include <media/msm_vidc.h>
+#include "media/msm_vidc_utils.h"
 #include "extra_data_handler.h"
 #include "ts_parser.h"
 #include "vidc_debug.h"
@@ -671,8 +673,8 @@ class omx_vdec: public qc_omx_component
         pthread_t async_thread_id;
         bool is_component_secure();
         OMX_BUFFERHEADERTYPE* get_omx_output_buffer_header(int index);
-        OMX_ERRORTYPE set_dpb(bool is_split_mode, int dpb_color_format);
-        OMX_ERRORTYPE decide_dpb_buffer_mode(bool is_downscalar_enabled);
+        OMX_ERRORTYPE set_dpb(bool is_split_mode);
+        OMX_ERRORTYPE decide_dpb_buffer_mode();
         int dpb_bit_depth;
         bool check_supported_flexible_formats(OMX_COLOR_FORMATTYPE required_format);
         bool is_flexible_format;//To save status if required format is flexible color formats
