@@ -1926,8 +1926,13 @@ int omx_vdec::update_resolution(int width, int height, int stride, int scan_line
     return format_changed;
 }
 
-int omx_vdec::log_input_buffers(const char *buffer_addr, int buffer_len, uint64_t timeStamp)
+int omx_vdec::log_input_buffers(const char *buffer_addr, int buffer_len, uint64_t timeStamp, int fd)
 {
+#ifdef USE_ION
+    start_buffer_access(fd);
+#else
+    (void)fd;
+#endif
     if (m_debug.in_buffer_log && !m_debug.infile) {
         if(!strncmp(drv_ctx.kind,"OMX.qcom.video.decoder.mpeg2", OMX_MAX_STRINGNAME_SIZE)) {
                 snprintf(m_debug.infile_name, OMX_MAX_STRINGNAME_SIZE, "%s/input_dec_%d_%d_%p_%" PRId64 ".mpg", m_debug.log_loc,
@@ -1954,6 +1959,9 @@ int omx_vdec::log_input_buffers(const char *buffer_addr, int buffer_len, uint64_
             DEBUG_PRINT_HIGH("Failed to open input file: %s for logging (%d:%s)",
                              m_debug.infile_name, errno, strerror(errno));
             m_debug.infile_name[0] = '\0';
+#ifdef USE_ION
+            end_buffer_access(fd);
+#endif
             return -1;
         }
         if (!strncmp(drv_ctx.kind, "OMX.qcom.video.decoder.vp8", OMX_MAX_STRINGNAME_SIZE) ||
@@ -1975,6 +1983,9 @@ int omx_vdec::log_input_buffers(const char *buffer_addr, int buffer_len, uint64_
         }
         fwrite(buffer_addr, buffer_len, 1, m_debug.infile);
     }
+#ifdef USE_ION
+    end_buffer_access(fd);
+#endif
     return 0;
 }
 
@@ -5444,12 +5455,7 @@ char *omx_vdec::ion_map(int fd, int len)
                                 MAP_SHARED, fd, 0);
     if (bufaddr != MAP_FAILED) {
 #ifdef USE_ION
-        struct dma_buf_sync buf_sync;
-        buf_sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW;
-        int rc = ioctl(fd, DMA_BUF_IOCTL_SYNC, &buf_sync);
-        if (rc) {
-            DEBUG_PRINT_ERROR("Failed DMA_BUF_IOCTL_SYNC");
-        }
+    start_buffer_access(fd);
 #endif
     }
     return bufaddr;
@@ -5470,12 +5476,9 @@ char *omx_vdec::ion_map(int fd, int len)
 OMX_ERRORTYPE omx_vdec::ion_unmap(int fd, void *bufaddr, int len)
 {
 #ifdef USE_ION
-    struct dma_buf_sync buf_sync;
-    buf_sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW;
-    int rc = ioctl(fd, DMA_BUF_IOCTL_SYNC, &buf_sync);
-    if (rc) {
-        DEBUG_PRINT_ERROR("Failed DMA_BUF_IOCTL_SYNC");
-    }
+    end_buffer_access(fd);
+#else
+    (void)fd;
 #endif
     if (-1 == munmap(bufaddr, len)) {
         DEBUG_PRINT_ERROR("munmap failed.");
@@ -5509,6 +5512,7 @@ OMX_ERRORTYPE omx_vdec::allocate_extradata()
             free_ion_memory(&drv_ctx.extradata_info.ion);
         }
         drv_ctx.extradata_info.size = (drv_ctx.extradata_info.size + 4095) & (~4095);
+        // Decoder extradata is always uncached as buffer sizes are very small
         bool status = alloc_map_ion_memory(
                 drv_ctx.extradata_info.size, &drv_ctx.extradata_info.ion, 0);
         if (status == false) {
@@ -6165,7 +6169,6 @@ OMX_ERRORTYPE  omx_vdec::allocate_input_buffer(
     unsigned   i = 0;
     unsigned char *buf_addr = NULL;
     int pmem_fd = -1, ret = 0;
-    unsigned int align_size = 0;
 
     (void) hComp;
     (void) port;
@@ -6244,11 +6247,10 @@ OMX_ERRORTYPE  omx_vdec::allocate_input_buffer(
         int rc;
         DEBUG_PRINT_LOW("Allocate input Buffer");
 #ifdef USE_ION
-        align_size = drv_ctx.ip_buf.buffer_size + 512;
-        align_size = (align_size + drv_ctx.ip_buf.alignment - 1)&(~(drv_ctx.ip_buf.alignment - 1));
+        // Input buffers are cached to make parsing faster
         bool status = alloc_map_ion_memory(
                 drv_ctx.ip_buf.buffer_size, &drv_ctx.ip_buf_ion_info[i],
-                secure_mode ? SECURE_FLAGS_INPUT_BUFFER : 0);
+                secure_mode ? SECURE_FLAGS_INPUT_BUFFER : ION_FLAG_CACHED);
         if (status == false) {
             return OMX_ErrorInsufficientResources;
         }
@@ -7033,7 +7035,7 @@ OMX_ERRORTYPE  omx_vdec::empty_this_buffer_proxy(OMX_IN OMX_HANDLETYPE  hComp,
         handle_demux_data(buffer);
     }
 
-    log_input_buffers((const char *)temp_buffer->bufferaddr, temp_buffer->buffer_len, buffer->nTimeStamp);
+    log_input_buffers((const char *)temp_buffer->bufferaddr, temp_buffer->buffer_len, buffer->nTimeStamp, temp_buffer->pmem_fd);
 
     if (buffer->nFlags & QOMX_VIDEO_BUFFERFLAG_EOSEQ) {
         buffer->nFlags &= ~QOMX_VIDEO_BUFFERFLAG_EOSEQ;
@@ -8680,6 +8682,37 @@ void omx_vdec::free_ion_memory(struct vdec_ion *buf_ion_info)
         buf_ion_info->dev_fd = -1;
     }
 }
+
+void omx_vdec::start_buffer_access(int fd)
+{
+    struct dma_buf_sync buf_sync;
+
+    if (fd < 0)
+        return;
+
+    buf_sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW;
+    int rc = ioctl(fd, DMA_BUF_IOCTL_SYNC, &buf_sync);
+    if (rc) {
+        DEBUG_PRINT_ERROR("Failed DMA_BUF_IOCTL_SYNC start fd : %d", fd);
+    }
+    return;
+}
+
+void omx_vdec::end_buffer_access(int fd)
+{
+    struct dma_buf_sync buf_sync;
+
+    if (fd < 0)
+        return;
+
+    buf_sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW;
+    int rc = ioctl(fd, DMA_BUF_IOCTL_SYNC, &buf_sync);
+    if (rc) {
+        DEBUG_PRINT_ERROR("Failed DMA_BUF_IOCTL_SYNC end fd : %d", fd);
+    }
+    return;
+}
+
 #endif
 void omx_vdec::free_output_buffer_header()
 {
