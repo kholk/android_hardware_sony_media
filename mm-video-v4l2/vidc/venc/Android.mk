@@ -21,11 +21,10 @@ libmm-venc-def += -Werror
 libmm-venc-def += -D_ANDROID_ICS_
 
 TARGETS_THAT_USE_FLAG_MSM8226 := msm8226 msm8916 msm8909
-TARGETS_THAT_DONT_NEED_SW_VENC_MPEG4 := msm8226 msm8916 msm8992 msm8996 sdm660 msm8998
+TARGETS_THAT_DONT_NEED_SW_VENC_MPEG4 := msm8226 msm8916 msm8952 msm8992 msm8996 sdm660 msm8998 sdm845
 TARGETS_THAT_DONT_SUPPORT_SW_VENC_ROTATION := msm8226 msm8916 msm8992 msm8996 sdm660 msm8998 msm8909 msm8937
 
 TARGETS_THAT_NEED_SW_VENC_HEVC := msm8992
-TARGETS_THAT_SUPPORT_VQZIP := msm8996 msm8998
 
 ifeq ($(TARGET_BOARD_PLATFORM),msm8610)
 libmm-venc-def += -D_MSM8610_
@@ -61,12 +60,12 @@ endif
 libmm-venc-inc      := $(LOCAL_PATH)/inc
 libmm-venc-inc      += $(TOP)/system/core/libion/include
 libmm-venc-inc      += $(TOP)/system/core/libion/kernel-headers
-libmm-venc-inc      += $(TOP)/hardware/qcom/media/mm-video-v4l2/vidc/common/inc
-libmm-venc-inc      += hardware/qcom/media/mm-core/inc
-libmm-venc-inc      += hardware/qcom/media/libstagefrighthw
-libmm-venc-inc      += hardware/qcom/media/libplatformconfig
+libmm-venc-inc      += $(QCOM_MEDIA_ROOT)/mm-video-v4l2/vidc/common/inc
+libmm-venc-inc      += $(QCOM_MEDIA_ROOT)/mm-core/inc
+libmm-venc-inc      += $(QCOM_MEDIA_ROOT)/libstagefrighthw
+libmm-venc-inc      += $(QCOM_MEDIA_ROOT)/libplatformconfig
 libmm-venc-inc      += $(TARGET_OUT_HEADERS)/adreno
-libmm-venc-inc      += hardware/qcom/media/libc2dcolorconvert
+libmm-venc-inc      += $(QCOM_MEDIA_ROOT)/libc2dcolorconvert
 libmm-venc-inc      += $(TARGET_OUT_HEADERS)/libvqzip
 libmm-venc-inc      += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/include
 libmm-venc-inc      += $(TOP)/frameworks/native/libs/nativewindow/include
@@ -74,7 +73,7 @@ libmm-venc-inc      += $(TOP)/frameworks/native/libs/nativebase/include
 libmm-venc-inc      += $(TOP)/frameworks/native/libs/arect/include
 
 ifeq ($(ENABLE_HYP),true)
-libmm-venc-inc      += hardware/qcom/media/hypv-intercept
+libmm-venc-inc      += $(QCOM_MEDIA_ROOT)/hypv-intercept
 endif
 
 ifneq ($(call is-board-platform-in-list, $(TARGETS_THAT_DONT_SUPPORT_SW_VENC_ROTATION)),true)
@@ -101,7 +100,13 @@ LOCAL_HEADER_LIBRARIES := \
         libcutils_headers \
         libutils_headers \
         libhardware_headers \
-        display_intf_headers
+        display_headers
+
+ifeq ($(TARGET_USES_GRALLOC1), true)
+LOCAL_HEADER_LIBRARIES += display_intf_headers_gralloc1
+else
+LOCAL_HEADER_LIBRARIES += display_intf_headers_gralloc
+endif
 
 LOCAL_C_INCLUDES                := $(libmm-venc-inc)
 LOCAL_ADDITIONAL_DEPENDENCIES   := $(libmm-venc-add-dep)
@@ -144,7 +149,13 @@ LOCAL_HEADER_LIBRARIES := \
         libnativebase_headers \
         libutils_headers \
         libhardware_headers \
-        display_intf_headers
+        display_headers
+
+ifeq ($(TARGET_USES_GRALLOC1), true)
+LOCAL_HEADER_LIBRARIES += display_intf_headers_gralloc1
+else
+LOCAL_HEADER_LIBRARIES += display_intf_headers_gralloc
+endif
 
 LOCAL_C_INCLUDES                := $(libmm-venc-inc)
 LOCAL_ADDITIONAL_DEPENDENCIES   := $(libmm-venc-add-dep)

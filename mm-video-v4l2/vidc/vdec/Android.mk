@@ -58,15 +58,15 @@ include $(CLEAR_VARS)
 libmm-vdec-inc          := $(LOCAL_PATH)/inc
 libmm-vdec-inc          += $(TOP)/system/core/libion/include
 libmm-vdec-inc          += $(TOP)/system/core/libion/kernel-headers
-libmm-vdec-inc          += $(TOP)/hardware/qcom/media/mm-video-v4l2/vidc/common/inc
-libmm-vdec-inc          += $(TOP)/hardware/qcom/media/mm-core/inc
-libmm-vdec-inc          += hardware/qcom/media/libplatformconfig
+libmm-vdec-inc          += $(QCOM_MEDIA_ROOT)/mm-video-v4l2/vidc/common/inc
+libmm-vdec-inc          += $(QCOM_MEDIA_ROOT)/mm-core/inc
+libmm-vdec-inc          += $(QCOM_MEDIA_ROOT)/libplatformconfig
 libmm-vdec-inc          += $(TARGET_OUT_HEADERS)/adreno
-libmm-vdec-inc      	+= $(TOP)/hardware/qcom/media/libc2dcolorconvert
+libmm-vdec-inc          += $(QCOM_MEDIA_ROOT)/libc2dcolorconvert
 libmm-vdec-inc      	+= $(TARGET_OUT_HEADERS)/mm-video/SwVdec
 libmm-vdec-inc      	+= $(TARGET_OUT_HEADERS)/mm-video/swvdec
 libmm-vdec-inc      	+= $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/include
-libmm-vdec-inc      	+= $(TOP)/hardware/qcom/media/libarbitrarybytes/inc
+libmm-vdec-inc      	+= $(QCOM_MEDIA_ROOT)/libarbitrarybytes/inc
 
 ifeq ($(PLATFORM_SDK_VERSION), 18)  #JB_MR2
 libmm-vdec-def += -DANDROID_JELLYBEAN_MR2=1
@@ -108,7 +108,13 @@ LOCAL_HEADER_LIBRARIES := \
         libnativebase_headers \
         libutils_headers \
         libhardware_headers \
-        display_intf_headers
+        display_headers
+
+ifeq ($(TARGET_USES_GRALLOC1), true)
+LOCAL_HEADER_LIBRARIES += display_intf_headers_gralloc1
+else
+LOCAL_HEADER_LIBRARIES += display_intf_headers_gralloc
+endif
 
 LOCAL_C_INCLUDES                += $(libmm-vdec-inc)
 LOCAL_ADDITIONAL_DEPENDENCIES   := $(libmm-vdec-add-dep)
@@ -150,7 +156,14 @@ LOCAL_HEADER_LIBRARIES := \
         libnativebase_headers \
         libutils_headers \
         libhardware_headers \
-        display_intf_headers
+        display_headers
+
+ifeq ($(TARGET_USES_GRALLOC1), true)
+LOCAL_HEADER_LIBRARIES += display_intf_headers_gralloc1
+else
+LOCAL_HEADER_LIBRARIES += display_intf_headers_gralloc
+endif
+
 
 LOCAL_C_INCLUDES              += $(libmm-vdec-inc)
 LOCAL_ADDITIONAL_DEPENDENCIES := $(libmm-vdec-add-dep)

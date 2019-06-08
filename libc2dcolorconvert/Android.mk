@@ -14,7 +14,13 @@ LOCAL_C_INCLUDES += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/include
 LOCAL_HEADER_LIBRARIES := \
         libutils_headers \
         libhardware_headers \
-        display_intf_headers
+        display_headers
+
+ifeq ($(TARGET_USES_GRALLOC1), true)
+LOCAL_HEADER_LIBRARIES += display_intf_headers_gralloc1
+else
+LOCAL_HEADER_LIBRARIES += display_intf_headers_gralloc
+endif
 
 LOCAL_SHARED_LIBRARIES := liblog libdl
 
