@@ -70,6 +70,12 @@ extern "C" {
 
 #ifdef USE_ION
 #include <linux/msm_ion.h>
+#if TARGET_ION_ABI_VERSION >= 2
+#include <ion/ion.h>
+#include <linux/dma-buf.h>
+#else
+#include <linux/ion.h>
+#endif
 //#include <binder/MemoryHeapIon.h>
 //#else
 #endif
@@ -431,9 +437,9 @@ struct vdec_framerate {
 
 #ifdef USE_ION
 struct vdec_ion {
-    int ion_device_fd;
-    struct ion_fd_data fd_ion_data;
-    struct ion_allocation_data ion_alloc_data;
+    int dev_fd;
+    struct ion_allocation_data alloc_data;
+    int data_fd;
 };
 #endif
 
@@ -655,6 +661,8 @@ class omx_vdec: public qc_omx_component
         void complete_pending_buffer_done_cbs();
         struct video_driver_context drv_ctx;
         int m_poll_efd;
+        char *ion_map(int fd, int len);
+        OMX_ERRORTYPE ion_unmap(int fd, void *bufaddr, int len);
         OMX_ERRORTYPE allocate_extradata();
         void free_extradata();
         int update_resolution(int width, int height, int stride, int scan_lines);
@@ -944,9 +952,7 @@ class omx_vdec: public qc_omx_component
         bool align_pmem_buffers(int pmem_fd, OMX_U32 buffer_size,
                 OMX_U32 alignment);
 #ifdef USE_ION
-        int alloc_map_ion_memory(OMX_U32 buffer_size,
-                OMX_U32 alignment, struct ion_allocation_data *alloc_data,
-                struct ion_fd_data *fd_data,int flag);
+        bool alloc_map_ion_memory(OMX_U32 buffer_size, vdec_ion *ion_info, int flag);
         void free_ion_memory(struct vdec_ion *buf_ion_info);
 #endif
 
@@ -1264,12 +1270,12 @@ class omx_vdec: public qc_omx_component
 #endif
                 unsigned char *pmem_baseaddress[MAX_COUNT];
                 int pmem_fd[MAX_COUNT];
-                OMX_ERRORTYPE cache_ops(unsigned int index, unsigned int cmd);
+                OMX_ERRORTYPE cache_ops(unsigned int index);
                 inline OMX_ERRORTYPE cache_clean_buffer(unsigned int index) {
-                    return cache_ops(index, ION_IOC_CLEAN_CACHES);
+                    return cache_ops(index);
                 }
                 OMX_ERRORTYPE cache_clean_invalidate_buffer(unsigned int index) {
-                    return cache_ops(index, ION_IOC_CLEAN_INV_CACHES);
+                    return cache_ops(index);
                 }
         };
         allocate_color_convert_buf client_buffers;

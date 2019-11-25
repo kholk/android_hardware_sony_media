@@ -131,13 +131,13 @@ extern "C" {
 #ifdef MASTER_SIDE_CP
 #define MEM_HEAP_ID ION_SECURE_HEAP_ID
 #define SECURE_ALIGN SZ_4K
-#define SECURE_FLAGS_INPUT_BUFFER (ION_SECURE | ION_FLAG_CP_BITSTREAM)
-#define SECURE_FLAGS_OUTPUT_BUFFER (ION_SECURE | ION_FLAG_CP_PIXEL)
+#define SECURE_FLAGS_INPUT_BUFFER (ION_FLAG_SECURE | ION_FLAG_CP_BITSTREAM)
+#define SECURE_FLAGS_OUTPUT_BUFFER (ION_FLAG_SECURE | ION_FLAG_CP_PIXEL)
 #else //SLAVE_SIDE_CP
 #define MEM_HEAP_ID ION_CP_MM_HEAP_ID
 #define SECURE_ALIGN SZ_1M
-#define SECURE_FLAGS_INPUT_BUFFER ION_SECURE
-#define SECURE_FLAGS_OUTPUT_BUFFER ION_SECURE
+#define SECURE_FLAGS_INPUT_BUFFER ION_FLAG_SECURE
+#define SECURE_FLAGS_OUTPUT_BUFFER ION_FLAG_SECURE
 #endif
 
 #define LUMINANCE_DIV_FACTOR 10000.0
@@ -735,7 +735,8 @@ omx_vdec::omx_vdec(): m_error_propogated(false),
 {
     m_poll_efd = -1;
     drv_ctx.video_driver_fd = -1;
-    drv_ctx.extradata_info.ion.fd_ion_data.fd = -1;
+    drv_ctx.extradata_info.ion.data_fd = -1;
+    drv_ctx.extradata_info.ion.dev_fd = -1;
     /* Assumption is that , to begin with , we have all the frames with decoder */
     DEBUG_PRINT_HIGH("In %u bit OMX vdec Constructor", (unsigned int)sizeof(long) * 8);
     memset(&m_debug,0,sizeof(m_debug));
@@ -2061,9 +2062,8 @@ int omx_vdec::log_output_buffers(OMX_BUFFERHEADERTYPE *buffer) {
     buf_index = buffer - m_out_mem_ptr;
     bufaddr = (char *)drv_ctx.ptr_outputbuffer[buf_index].bufferaddr;
     if (dynamic_buf_mode && !secure_mode) {
-        bufaddr = (char*)mmap(0, drv_ctx.ptr_outputbuffer[buf_index].buffer_len,
-                                 PROT_READ|PROT_WRITE, MAP_SHARED,
-                                 drv_ctx.ptr_outputbuffer[buf_index].pmem_fd, 0);
+        bufaddr = ion_map(drv_ctx.ptr_outputbuffer[buf_index].pmem_fd,
+                          drv_ctx.ptr_outputbuffer[buf_index].buffer_len);
         //mmap returns (void *)-1 on failure and sets error code in errno.
         if (bufaddr == MAP_FAILED) {
             DEBUG_PRINT_ERROR("mmap failed - errno: %d", errno);
@@ -2164,7 +2164,8 @@ int omx_vdec::log_output_buffers(OMX_BUFFERHEADERTYPE *buffer) {
     }
 
     if (dynamic_buf_mode && !secure_mode) {
-        munmap(bufaddr, drv_ctx.ptr_outputbuffer[buf_index].buffer_len);
+        ion_unmap(drv_ctx.ptr_outputbuffer[buf_index].pmem_fd, bufaddr,
+                  drv_ctx.ptr_outputbuffer[buf_index].buffer_len);
     }
     return 0;
 }
@@ -5234,7 +5235,7 @@ OMX_ERRORTYPE  omx_vdec::set_config(OMX_IN OMX_HANDLETYPE      hComp,
 
         switch (config->eDecodeType) {
             case OMX_QCOM_PictypeDecode_I:
-                control.value = V4L2_MPEG_VIDC_VIDEO_PICTYPE_DECODE_ON;
+                control.value = V4L2_MPEG_VIDC_VIDEO_PICTYPE_DECODE_I;
                 break;
             case OMX_QCOM_PictypeDecode_IPB:
             default:
@@ -5476,6 +5477,65 @@ OMX_ERRORTYPE  omx_vdec::component_tunnel_request(OMX_IN OMX_HANDLETYPE  hComp,
     return OMX_ErrorNotImplemented;
 }
 
+
+/* ======================================================================
+   FUNCTION
+   omx_vdec::ion_map
+   DESCRIPTION
+   Map the memory and run the ioctl SYNC operations
+   on ION fd with DMA_BUF_IOCTL_SYNC
+   PARAMETERS
+   fd    : ION fd
+   len   : Lenth of the memory
+   RETURN VALUE
+   ERROR: mapped memory pointer
+   ========================================================================== */
+char *omx_vdec::ion_map(int fd, int len)
+{
+    char *bufaddr = (char*)mmap(NULL, len, PROT_READ|PROT_WRITE,
+                                MAP_SHARED, fd, 0);
+    if (bufaddr != MAP_FAILED) {
+#ifdef USE_ION
+        struct dma_buf_sync buf_sync;
+        buf_sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW;
+        int rc = ioctl(fd, DMA_BUF_IOCTL_SYNC, &buf_sync);
+        if (rc) {
+            DEBUG_PRINT_ERROR("Failed DMA_BUF_IOCTL_SYNC");
+        }
+#endif
+    }
+    return bufaddr;
+}
+
+/* ======================================================================
+   FUNCTION
+   omx_vdec::ion_unmap
+   DESCRIPTION
+   Unmap the memory
+   PARAMETERS
+   fd      : ION fd
+   bufaddr : buffer address
+   len     : Lenth of the memory
+   RETURN VALUE
+   OMX_Error*
+   ========================================================================== */
+OMX_ERRORTYPE omx_vdec::ion_unmap(int fd, void *bufaddr, int len)
+{
+#ifdef USE_ION
+    struct dma_buf_sync buf_sync;
+    buf_sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW;
+    int rc = ioctl(fd, DMA_BUF_IOCTL_SYNC, &buf_sync);
+    if (rc) {
+        DEBUG_PRINT_ERROR("Failed DMA_BUF_IOCTL_SYNC");
+    }
+#endif
+    if (-1 == munmap(bufaddr, len)) {
+        DEBUG_PRINT_ERROR("munmap failed.");
+        return OMX_ErrorInsufficientResources;
+    }
+    return OMX_ErrorNone;
+}
+
 /* ======================================================================
    FUNCTION
    omx_vdec::UseOutputBuffer
@@ -5494,27 +5554,24 @@ OMX_ERRORTYPE omx_vdec::allocate_extradata()
 {
 #ifdef USE_ION
     if (drv_ctx.extradata_info.buffer_size) {
-        if (drv_ctx.extradata_info.ion.ion_alloc_data.handle) {
-            munmap((void *)drv_ctx.extradata_info.uaddr, drv_ctx.extradata_info.size);
-            close(drv_ctx.extradata_info.ion.fd_ion_data.fd);
+        if (drv_ctx.extradata_info.ion.data_fd >= 0) {
+            ion_unmap(drv_ctx.extradata_info.ion.data_fd,
+                      (void *)drv_ctx.extradata_info.uaddr,
+                      drv_ctx.extradata_info.size);
             free_ion_memory(&drv_ctx.extradata_info.ion);
         }
         drv_ctx.extradata_info.size = (drv_ctx.extradata_info.size + 4095) & (~4095);
-        drv_ctx.extradata_info.ion.ion_device_fd = alloc_map_ion_memory(
-                drv_ctx.extradata_info.size, 4096,
-                &drv_ctx.extradata_info.ion.ion_alloc_data,
-                &drv_ctx.extradata_info.ion.fd_ion_data, 0);
-        if (drv_ctx.extradata_info.ion.ion_device_fd < 0) {
+        bool status = alloc_map_ion_memory(
+                drv_ctx.extradata_info.size, &drv_ctx.extradata_info.ion, 0);
+        if (status == false) {
             DEBUG_PRINT_ERROR("Failed to alloc extradata memory");
             return OMX_ErrorInsufficientResources;
         }
-        drv_ctx.extradata_info.uaddr = (char *)mmap(NULL,
-                drv_ctx.extradata_info.size,
-                PROT_READ|PROT_WRITE, MAP_SHARED,
-                drv_ctx.extradata_info.ion.fd_ion_data.fd , 0);
+
+        drv_ctx.extradata_info.uaddr = ion_map(drv_ctx.extradata_info.ion.data_fd,
+                                               drv_ctx.extradata_info.size);
         if (drv_ctx.extradata_info.uaddr == MAP_FAILED) {
             DEBUG_PRINT_ERROR("Failed to map extradata memory");
-            close(drv_ctx.extradata_info.ion.fd_ion_data.fd);
             free_ion_memory(&drv_ctx.extradata_info.ion);
             return OMX_ErrorInsufficientResources;
         }
@@ -5534,8 +5591,9 @@ void omx_vdec::free_extradata()
 {
 #ifdef USE_ION
     if (drv_ctx.extradata_info.uaddr) {
-        munmap((void *)drv_ctx.extradata_info.uaddr, drv_ctx.extradata_info.size);
-        close(drv_ctx.extradata_info.ion.fd_ion_data.fd);
+        ion_unmap(drv_ctx.extradata_info.ion.data_fd,
+                  (void *)drv_ctx.extradata_info.uaddr,
+                  drv_ctx.extradata_info.size);
         free_ion_memory(&drv_ctx.extradata_info.ion);
     }
 #endif
@@ -5643,8 +5701,7 @@ OMX_ERRORTYPE  omx_vdec::use_output_buffer(
 
             if (!m_use_android_native_buffers) {
                 if (!secure_mode) {
-                    buff =  (OMX_U8*)mmap(0, handle->size,
-                            PROT_READ|PROT_WRITE, MAP_SHARED, handle->fd, 0);
+                    buff = (OMX_U8*)ion_map(handle->fd, handle->size);
                     if (buff == MAP_FAILED) {
                         DEBUG_PRINT_ERROR("Failed to mmap pmem with fd = %d, size = %d", handle->fd, handle->size);
                         return OMX_ErrorInsufficientResources;
@@ -5669,17 +5726,16 @@ OMX_ERRORTYPE  omx_vdec::use_output_buffer(
 
             if (!ouput_egl_buffers && !m_use_output_pmem) {
 #ifdef USE_ION
-                drv_ctx.op_buf_ion_info[i].ion_device_fd = alloc_map_ion_memory(
-                        drv_ctx.op_buf.buffer_size,drv_ctx.op_buf.alignment,
-                        &drv_ctx.op_buf_ion_info[i].ion_alloc_data,
-                        &drv_ctx.op_buf_ion_info[i].fd_ion_data,
+                bool status = alloc_map_ion_memory(
+                        drv_ctx.op_buf.buffer_size, &drv_ctx.op_buf_ion_info[i],
                         secure_mode ? SECURE_FLAGS_OUTPUT_BUFFER : 0);
-                if (drv_ctx.op_buf_ion_info[i].ion_device_fd < 0) {
-                    DEBUG_PRINT_ERROR("ION device fd is bad %d", drv_ctx.op_buf_ion_info[i].ion_device_fd);
+                if (status == false) {
+                    DEBUG_PRINT_ERROR("ION device fd is bad %d",
+                                      (int) drv_ctx.op_buf_ion_info[i].data_fd);
                     return OMX_ErrorInsufficientResources;
                 }
                 drv_ctx.ptr_outputbuffer[i].pmem_fd = \
-                                      drv_ctx.op_buf_ion_info[i].fd_ion_data.fd;
+                                      drv_ctx.op_buf_ion_info[i].data_fd;
 #else
                 drv_ctx.ptr_outputbuffer[i].pmem_fd = \
                                       open (MEM_DEVICE,O_RDWR);
@@ -5709,11 +5765,9 @@ OMX_ERRORTYPE  omx_vdec::use_output_buffer(
 #endif
                 if (!secure_mode) {
                     drv_ctx.ptr_outputbuffer[i].bufferaddr =
-                        (unsigned char *)mmap(NULL, drv_ctx.op_buf.buffer_size,
-                                PROT_READ|PROT_WRITE, MAP_SHARED,
-                                drv_ctx.ptr_outputbuffer[i].pmem_fd,0);
+                        (unsigned char *)ion_map(drv_ctx.ptr_outputbuffer[i].pmem_fd,
+                                                 drv_ctx.op_buf.buffer_size);
                     if (drv_ctx.ptr_outputbuffer[i].bufferaddr == MAP_FAILED) {
-                        close(drv_ctx.ptr_outputbuffer[i].pmem_fd);
 #ifdef USE_ION
                         free_ion_memory(&drv_ctx.op_buf_ion_info[i]);
 #endif
@@ -6037,8 +6091,9 @@ OMX_ERRORTYPE omx_vdec::free_input_buffer(OMX_BUFFERHEADERTYPE *bufferHdr)
     if (index < drv_ctx.ip_buf.actualcount && drv_ctx.ptr_inputbuffer) {
         if (drv_ctx.ptr_inputbuffer[index].pmem_fd >= 0) {
             if (!secure_mode) {
-                munmap (drv_ctx.ptr_inputbuffer[index].bufferaddr,
-                        drv_ctx.ptr_inputbuffer[index].mmaped_size);
+                ion_unmap(drv_ctx.ptr_inputbuffer[index].pmem_fd,
+                          drv_ctx.ptr_inputbuffer[index].bufferaddr,
+                          drv_ctx.ptr_inputbuffer[index].mmaped_size);
             }
 
             if (allocate_native_handle){
@@ -6046,8 +6101,10 @@ OMX_ERRORTYPE omx_vdec::free_input_buffer(OMX_BUFFERHEADERTYPE *bufferHdr)
                 native_handle_close(nh);
                 native_handle_delete(nh);
             } else {
+#ifndef USE_ION
                 // Close fd for non-secure and secure non-native-handle case
                 close(drv_ctx.ptr_inputbuffer[index].pmem_fd);
+#endif
             }
             drv_ctx.ptr_inputbuffer[index].pmem_fd = -1;
 
@@ -6100,21 +6157,21 @@ OMX_ERRORTYPE omx_vdec::free_output_buffer(OMX_BUFFERHEADERTYPE *bufferHdr)
             if (m_enable_android_native_buffers) {
                 if (!secure_mode) {
                     if (drv_ctx.ptr_outputbuffer[index].pmem_fd > 0) {
-                        munmap(drv_ctx.ptr_outputbuffer[index].bufferaddr,
-                                drv_ctx.ptr_outputbuffer[index].mmaped_size);
+                        ion_unmap(drv_ctx.ptr_outputbuffer[index].pmem_fd,
+                                  drv_ctx.ptr_outputbuffer[index].bufferaddr,
+                                  drv_ctx.ptr_outputbuffer[index].mmaped_size);
                     }
                 }
-                drv_ctx.ptr_outputbuffer[index].pmem_fd = -1;
             } else {
 #endif
                 if (drv_ctx.ptr_outputbuffer[index].pmem_fd > 0 && !ouput_egl_buffers && !m_use_output_pmem) {
                     if (!secure_mode) {
-                        munmap (drv_ctx.ptr_outputbuffer[index].bufferaddr,
-                                drv_ctx.ptr_outputbuffer[index].mmaped_size);
+                        ion_unmap(drv_ctx.ptr_outputbuffer[index].pmem_fd,
+                                  drv_ctx.ptr_outputbuffer[index].bufferaddr,
+                                  drv_ctx.ptr_outputbuffer[index].mmaped_size);
                         drv_ctx.ptr_outputbuffer[index].bufferaddr = NULL;
                         drv_ctx.ptr_outputbuffer[index].mmaped_size = 0;
                     }
-                    close (drv_ctx.ptr_outputbuffer[index].pmem_fd);
                     drv_ctx.ptr_outputbuffer[index].pmem_fd = -1;
 #ifdef USE_ION
                     free_ion_memory(&drv_ctx.op_buf_ion_info[index]);
@@ -6222,7 +6279,8 @@ OMX_ERRORTYPE  omx_vdec::allocate_input_buffer(
         for (i=0; i < drv_ctx.ip_buf.actualcount; i++) {
             drv_ctx.ptr_inputbuffer [i].pmem_fd = -1;
 #ifdef USE_ION
-            drv_ctx.ip_buf_ion_info[i].ion_device_fd = -1;
+            drv_ctx.ip_buf_ion_info[i].data_fd = -1;
+            drv_ctx.ip_buf_ion_info[i].dev_fd = -1;
 #endif
         }
     }
@@ -6240,15 +6298,13 @@ OMX_ERRORTYPE  omx_vdec::allocate_input_buffer(
 #ifdef USE_ION
         align_size = drv_ctx.ip_buf.buffer_size + 512;
         align_size = (align_size + drv_ctx.ip_buf.alignment - 1)&(~(drv_ctx.ip_buf.alignment - 1));
-        drv_ctx.ip_buf_ion_info[i].ion_device_fd = alloc_map_ion_memory(
-                align_size, drv_ctx.op_buf.alignment,
-                &drv_ctx.ip_buf_ion_info[i].ion_alloc_data,
-                &drv_ctx.ip_buf_ion_info[i].fd_ion_data, secure_mode ?
-                SECURE_FLAGS_INPUT_BUFFER : 0);
-        if (drv_ctx.ip_buf_ion_info[i].ion_device_fd < 0) {
+        bool status = alloc_map_ion_memory(
+                drv_ctx.ip_buf.buffer_size, &drv_ctx.ip_buf_ion_info[i],
+                secure_mode ? SECURE_FLAGS_INPUT_BUFFER : 0);
+        if (status == false) {
             return OMX_ErrorInsufficientResources;
         }
-        pmem_fd = drv_ctx.ip_buf_ion_info[i].fd_ion_data.fd;
+        pmem_fd = drv_ctx.ip_buf_ion_info[i].data_fd;
 #else
         pmem_fd = open (MEM_DEVICE,O_RDWR);
 
@@ -6274,14 +6330,13 @@ OMX_ERRORTYPE  omx_vdec::allocate_input_buffer(
         }
 #endif
         if (!secure_mode) {
-            buf_addr = (unsigned char *)mmap(NULL,
-                    drv_ctx.ip_buf.buffer_size,
-                    PROT_READ|PROT_WRITE, MAP_SHARED, pmem_fd, 0);
+            buf_addr = (unsigned char *)ion_map(pmem_fd, drv_ctx.ip_buf.buffer_size);
 
             if (buf_addr == MAP_FAILED) {
-                close(pmem_fd);
 #ifdef USE_ION
                 free_ion_memory(&drv_ctx.ip_buf_ion_info[i]);
+#else
+                close(pmem_fd);
 #endif
                 DEBUG_PRINT_ERROR("Map Failed to allocate input buffer");
                 return OMX_ErrorInsufficientResources;
@@ -6364,9 +6419,7 @@ OMX_ERRORTYPE  omx_vdec::allocate_output_buffer(
     OMX_BUFFERHEADERTYPE       *bufHdr= NULL; // buffer header
     unsigned                         i= 0; // Temporary counter
 #ifdef USE_ION
-    int ion_device_fd =-1;
     struct ion_allocation_data ion_alloc_data;
-    struct ion_fd_data fd_ion_data;
 #endif
     if (!m_out_mem_ptr) {
         DEBUG_PRINT_HIGH("Allocate o/p buffer Header: Cnt(%d) Sz(%u)",
@@ -6506,6 +6559,7 @@ OMX_ERRORTYPE  omx_vdec::allocate_output_buffer(
         if (i < drv_ctx.op_buf.actualcount) {
             int rc;
             int pmem_fd = -1;
+            int fd = -1;
             unsigned char *pmem_baseaddress = NULL;
 
 #ifdef USE_ION
@@ -6514,18 +6568,14 @@ OMX_ERRORTYPE  omx_vdec::allocate_output_buffer(
             // If color-conversion is involved, Only the C2D output buffers are cached, no
             // need to cache the decoder's output buffers
             int cache_flag = client_buffers.is_color_conversion_enabled() ? 0 : ION_FLAG_CACHED;
-            ion_device_fd = alloc_map_ion_memory(drv_ctx.op_buf.buffer_size,
-                    secure_scaling_to_non_secure_opb ? SZ_4K : drv_ctx.op_buf.alignment,
-                    &ion_alloc_data, &fd_ion_data,
+            bool status = alloc_map_ion_memory(drv_ctx.op_buf.buffer_size,
+                    &drv_ctx.op_buf_ion_info[i],
                     (secure_mode && !secure_scaling_to_non_secure_opb) ?
                     SECURE_FLAGS_OUTPUT_BUFFER : cache_flag);
-            if (ion_device_fd < 0) {
+            if (status == false) {
                 return OMX_ErrorInsufficientResources;
             }
-            pmem_fd = fd_ion_data.fd;
-            drv_ctx.op_buf_ion_info[i].ion_device_fd = ion_device_fd;
-            drv_ctx.op_buf_ion_info[i].ion_alloc_data = ion_alloc_data;
-            drv_ctx.op_buf_ion_info[i].fd_ion_data = fd_ion_data;
+            pmem_fd = drv_ctx.op_buf_ion_info[i].data_fd;
 #else
             pmem_fd = open (MEM_DEVICE,O_RDWR);
             if (pmem_fd < 0) {
@@ -6541,15 +6591,14 @@ OMX_ERRORTYPE  omx_vdec::allocate_output_buffer(
             }
 #endif
             if (!secure_mode) {
-                pmem_baseaddress = (unsigned char *)mmap(NULL,
-                        drv_ctx.op_buf.buffer_size,
-                        PROT_READ|PROT_WRITE,MAP_SHARED,pmem_fd,0);
+                pmem_baseaddress = (unsigned char *)ion_map(pmem_fd, drv_ctx.op_buf.buffer_size);
                 if (pmem_baseaddress == MAP_FAILED) {
                     DEBUG_PRINT_ERROR("MMAP failed for Size %u",
                             (unsigned int)drv_ctx.op_buf.buffer_size);
-                    close(pmem_fd);
 #ifdef USE_ION
                     free_ion_memory(&drv_ctx.op_buf_ion_info[i]);
+#else
+                    close(pmem_fd);
 #endif
                     return OMX_ErrorInsufficientResources;
                 }
@@ -6569,7 +6618,7 @@ OMX_ERRORTYPE  omx_vdec::allocate_output_buffer(
             if (secure_mode) {
 #ifdef USE_ION
                 drv_ctx.ptr_outputbuffer[i].bufferaddr =
-                    (OMX_U8 *)(intptr_t)drv_ctx.op_buf_ion_info[i].fd_ion_data.fd;
+                    (OMX_U8 *)(intptr_t)drv_ctx.op_buf_ion_info[i].data_fd;
 #else
                 drv_ctx.ptr_outputbuffer[i].bufferaddr = *bufferHdr;
 #endif
@@ -7375,7 +7424,7 @@ OMX_ERRORTYPE  omx_vdec::fill_this_buffer_proxy(
         plane[extra_idx].length = drv_ctx.extradata_info.buffer_size;
         plane[extra_idx].m.userptr = (long unsigned int) (drv_ctx.extradata_info.uaddr + nPortIndex * drv_ctx.extradata_info.buffer_size);
 #ifdef USE_ION
-        plane[extra_idx].reserved[0] = drv_ctx.extradata_info.ion.fd_ion_data.fd;
+        plane[extra_idx].reserved[0] = drv_ctx.extradata_info.ion.data_fd;
 #endif
         plane[extra_idx].reserved[1] = nPortIndex * drv_ctx.extradata_info.buffer_size;
         plane[extra_idx].data_offset = 0;
@@ -8615,67 +8664,53 @@ bool omx_vdec::align_pmem_buffers(int pmem_fd, OMX_U32 buffer_size,
 }
 #endif
 #ifdef USE_ION
-int omx_vdec::alloc_map_ion_memory(OMX_U32 buffer_size,
-        OMX_U32 alignment, struct ion_allocation_data *alloc_data,
-        struct ion_fd_data *fd_data, int flag)
+bool omx_vdec::alloc_map_ion_memory(OMX_U32 buffer_size, vdec_ion *ion_info, int flag)
 {
-    int fd = -EINVAL;
     int rc = -EINVAL;
     int ion_dev_flag;
     struct vdec_ion ion_buf_info;
-    if (!alloc_data || buffer_size <= 0 || !fd_data) {
+    if (!ion_info || buffer_size <= 0) {
         DEBUG_PRINT_ERROR("Invalid arguments to alloc_map_ion_memory");
-        return -EINVAL;
-    }
-    ion_dev_flag = O_RDONLY;
-    fd = open (MEM_DEVICE, ion_dev_flag);
-    if (fd < 0) {
-        DEBUG_PRINT_ERROR("opening ion device failed with fd = %d", fd);
-        return fd;
+        return false;
     }
 
-    alloc_data->flags = flag;
-    alloc_data->len = buffer_size;
-    alloc_data->align = clip2(alignment);
-    if (alloc_data->align < 4096) {
-        alloc_data->align = 4096;
+    ion_info->dev_fd = ion_open();
+    if (ion_info->dev_fd < 0) {
+        DEBUG_PRINT_ERROR("opening ion device failed with ion_fd = %d", ion_info->dev_fd);
+        return false;
     }
 
-    alloc_data->heap_id_mask = ION_HEAP(ION_IOMMU_HEAP_ID);
-    if (secure_mode && (alloc_data->flags & ION_SECURE)) {
-        alloc_data->heap_id_mask = ION_HEAP(MEM_HEAP_ID);
+    ion_info->alloc_data.flags = flag;
+    ion_info->alloc_data.len = buffer_size;
+
+    ion_info->alloc_data.heap_id_mask = ION_HEAP(ION_SYSTEM_HEAP_ID);
+    if (secure_mode && (ion_info->alloc_data.flags & ION_FLAG_SECURE)) {
+        ion_info->alloc_data.heap_id_mask = ION_HEAP(MEM_HEAP_ID);
     }
 
     /* Use secure display cma heap for obvious reasons. */
-    if (alloc_data->flags & ION_FLAG_CP_BITSTREAM) {
-        alloc_data->heap_id_mask |= ION_HEAP(ION_SECURE_DISPLAY_HEAP_ID);
+    if (ion_info->alloc_data.flags & ION_FLAG_CP_BITSTREAM) {
+        ion_info->alloc_data.heap_id_mask |= ION_HEAP(ION_SECURE_DISPLAY_HEAP_ID);
     }
 
-    rc = ioctl(fd,ION_IOC_ALLOC,alloc_data);
-    if (rc || !alloc_data->handle) {
+    rc = ion_alloc_fd(ion_info->dev_fd, ion_info->alloc_data.len, 0,
+                      ion_info->alloc_data.heap_id_mask, ion_info->alloc_data.flags,
+                      &ion_info->data_fd);
+
+    if (rc || ion_info->data_fd < 0) {
         DEBUG_PRINT_ERROR("ION ALLOC memory failed");
-        alloc_data->handle = 0;
-        close(fd);
-        fd = -ENOMEM;
-        return fd;
+        ion_close(ion_info->dev_fd);
+        ion_info->data_fd = -1;
+        ion_info->dev_fd = -1;
+        return false;
     }
-    fd_data->handle = alloc_data->handle;
-    rc = ioctl(fd,ION_IOC_MAP,fd_data);
-    if (rc) {
-        DEBUG_PRINT_ERROR("ION MAP failed ");
-        ion_buf_info.ion_alloc_data = *alloc_data;
-        ion_buf_info.ion_device_fd = fd;
-        ion_buf_info.fd_ion_data = *fd_data;
-        free_ion_memory(&ion_buf_info);
-        fd_data->fd =-1;
-        fd = -ENOMEM;
-        return fd;
-    }
-    DEBUG_PRINT_HIGH("Alloc ion memory: fd %d len %d flags %#x mask %#x",
-        fd_data->fd, (unsigned int)alloc_data->len,
-        (unsigned int)alloc_data->flags, (unsigned int)alloc_data->heap_id_mask);
 
-    return fd;
+    DEBUG_PRINT_HIGH("Alloc ion memory: fd (dev:%d data:%d) len %d flags %#x mask %#x",
+                     ion_info->dev_fd, ion_info->data_fd, (unsigned int)ion_info->alloc_data.len,
+                     (unsigned int)ion_info->alloc_data.flags,
+                     (unsigned int)ion_info->alloc_data.heap_id_mask);
+
+    return true;
 }
 
 void omx_vdec::free_ion_memory(struct vdec_ion *buf_ion_info)
@@ -8685,20 +8720,20 @@ void omx_vdec::free_ion_memory(struct vdec_ion *buf_ion_info)
         DEBUG_PRINT_ERROR("ION: free called with invalid fd/allocdata");
         return;
     }
-    DEBUG_PRINT_HIGH("Free ion memory: fd %d len %d flags %#x mask %#x",
-        buf_ion_info->fd_ion_data.fd,
-        (unsigned int)buf_ion_info->ion_alloc_data.len,
-        (unsigned int)buf_ion_info->ion_alloc_data.flags,
-        (unsigned int)buf_ion_info->ion_alloc_data.heap_id_mask);
+    DEBUG_PRINT_HIGH("Free ion memory: mmap fd %d ion_dev fd %d len %d flags %#x mask %#x",
+        buf_ion_info->data_fd, buf_ion_info->dev_fd,
+        (unsigned int)buf_ion_info->alloc_data.len,
+        (unsigned int)buf_ion_info->alloc_data.flags,
+        (unsigned int)buf_ion_info->alloc_data.heap_id_mask);
 
-    if (ioctl(buf_ion_info->ion_device_fd,ION_IOC_FREE,
-                &buf_ion_info->ion_alloc_data.handle)) {
-        DEBUG_PRINT_ERROR("ION: free failed" );
+    if (buf_ion_info->data_fd >= 0) {
+        close(buf_ion_info->data_fd);
+        buf_ion_info->data_fd = -1;
     }
-    close(buf_ion_info->ion_device_fd);
-    buf_ion_info->ion_device_fd = -1;
-    buf_ion_info->ion_alloc_data.handle = 0;
-    buf_ion_info->fd_ion_data.fd = -1;
+    if (buf_ion_info->dev_fd >= 0) {
+        ion_close(buf_ion_info->dev_fd);
+        buf_ion_info->dev_fd = -1;
+    }
 }
 #endif
 void omx_vdec::free_output_buffer_header()
@@ -9238,7 +9273,8 @@ OMX_ERRORTYPE omx_vdec::allocate_output_headers()
                 bufHdr->pPlatformPrivate = pPlatformList;
                 drv_ctx.ptr_outputbuffer[i].pmem_fd = -1;
 #ifdef USE_ION
-                drv_ctx.op_buf_ion_info[i].ion_device_fd =-1;
+                drv_ctx.op_buf_ion_info[i].data_fd = -1;
+                drv_ctx.op_buf_ion_info[i].dev_fd = -1;
 #endif
                 /*Create a mapping between buffers*/
                 bufHdr->pOutputPortPrivate = &drv_ctx.ptr_respbuffer[i];
@@ -9889,8 +9925,8 @@ bool omx_vdec::handle_extradata(OMX_BUFFERHEADERTYPE *p_buf_hdr)
         return reconfig_event_sent;
     }
     if (!secure_mode) {
-        pBuffer = (OMX_U8*)mmap(0, drv_ctx.ptr_outputbuffer[buf_index].buffer_len,
-                    PROT_READ|PROT_WRITE, MAP_SHARED, drv_ctx.ptr_outputbuffer[buf_index].pmem_fd, 0);
+        pBuffer = (OMX_U8*)ion_map(drv_ctx.ptr_outputbuffer[buf_index].pmem_fd,
+                                   drv_ctx.ptr_outputbuffer[buf_index].buffer_len);
         if (pBuffer == MAP_FAILED) {
             DEBUG_PRINT_ERROR("handle_extradata output buffer mmap failed - errno: %d", errno);
             return reconfig_event_sent;
@@ -10278,7 +10314,7 @@ unrecognized_extradata:
         ptr_extradatabuff = (struct vdec_output_frameinfo *)p_buf_hdr->pOutputPortPrivate;
         ptr_extradatabuff->metadata_info.metabufaddr = (void *)p_extradata;
         ptr_extradatabuff->metadata_info.size = drv_ctx.extradata_info.buffer_size;
-        ptr_extradatabuff->metadata_info.fd = drv_ctx.extradata_info.ion.fd_ion_data.fd;
+        ptr_extradatabuff->metadata_info.fd = drv_ctx.extradata_info.ion.data_fd;
         ptr_extradatabuff->metadata_info.offset = buf_index * drv_ctx.extradata_info.buffer_size;
         ptr_extradatabuff->metadata_info.buffer_size = drv_ctx.extradata_info.size;
     }
@@ -11442,8 +11478,13 @@ OMX_ERRORTYPE omx_vdec::allocate_color_convert_buf::free_output_buffer(
         return OMX_ErrorBadParameter;
     }
     if (pmem_fd[index] >= 0) {
-        munmap(pmem_baseaddress[index], buffer_size_req);
-        close(pmem_fd[index]);
+        if (omx->ion_unmap(pmem_fd[index],
+                           pmem_baseaddress[index], buffer_size_req) != OMX_ErrorNone) {
+            return OMX_ErrorInsufficientResources;
+        }
+#ifndef USE_ION
+       close(pmem_fd[index]);
+#endif
     }
     pmem_fd[index] = -1;
 #ifdef USE_ION
@@ -11502,21 +11543,18 @@ OMX_ERRORTYPE omx_vdec::allocate_color_convert_buf::allocate_buffers_color_conve
     // Allocate color-conversion buffers as cached to improve software-reading
     // performance of YUV (thumbnails). NOTE: These buffers will need an explicit
     // cache invalidation.
-    op_buf_ion_info[i].ion_device_fd = omx->alloc_map_ion_memory(
-            buffer_size_req,buffer_alignment_req,
-            &op_buf_ion_info[i].ion_alloc_data,&op_buf_ion_info[i].fd_ion_data,
+    bool status = omx->alloc_map_ion_memory(
+            buffer_size_req, &op_buf_ion_info[i],
             ION_FLAG_CACHED);
-    pmem_fd[i] = op_buf_ion_info[i].fd_ion_data.fd;
-    if (op_buf_ion_info[i].ion_device_fd < 0) {
+    pmem_fd[i] = op_buf_ion_info[i].data_fd;
+    if (status == false) {
         DEBUG_PRINT_ERROR("alloc_map_ion failed in color_convert");
         return OMX_ErrorInsufficientResources;
     }
-    pmem_baseaddress[i] = (unsigned char *)mmap(NULL,buffer_size_req,
-            PROT_READ|PROT_WRITE,MAP_SHARED,pmem_fd[i],0);
+    pmem_baseaddress[i] = (unsigned char *)omx->ion_map(pmem_fd[i], buffer_size_req);
 
     if (pmem_baseaddress[i] == MAP_FAILED) {
         DEBUG_PRINT_ERROR("MMAP failed for Size %d",buffer_size_req);
-        close(pmem_fd[i]);
         omx->free_ion_memory(&op_buf_ion_info[i]);
         return OMX_ErrorInsufficientResources;
     }
@@ -11577,8 +11615,7 @@ bool omx_vdec::allocate_color_convert_buf::get_color_format(OMX_COLOR_FORMATTYPE
     return status;
 }
 
-OMX_ERRORTYPE omx_vdec::allocate_color_convert_buf::cache_ops(
-        unsigned int index, unsigned int cmd)
+OMX_ERRORTYPE omx_vdec::allocate_color_convert_buf::cache_ops(unsigned int index)
 {
     if (!enabled) {
         return OMX_ErrorNone;
@@ -11589,30 +11626,21 @@ OMX_ERRORTYPE omx_vdec::allocate_color_convert_buf::cache_ops(
         return OMX_ErrorBadParameter;
     }
 
-    struct ion_flush_data flush_data;
-    struct ion_custom_data custom_data;
+    struct dma_buf_sync dma_buf_sync_data[2];
+    dma_buf_sync_data[0].flags = DMA_BUF_SYNC_START;
+    dma_buf_sync_data[1].flags = DMA_BUF_SYNC_END;
 
-    memset(&flush_data, 0x0, sizeof(flush_data));
-    memset(&custom_data, 0x0, sizeof(custom_data));
-
-    flush_data.vaddr = pmem_baseaddress[index];
-    flush_data.fd = op_buf_ion_info[index].fd_ion_data.fd;
-    flush_data.handle = op_buf_ion_info[index].fd_ion_data.handle;
-    flush_data.length = buffer_size_req;
-    custom_data.cmd = cmd;
-    custom_data.arg = (unsigned long)&flush_data;
-
-    DEBUG_PRINT_LOW("Cache %s: fd=%d handle=%d va=%p size=%d",
-            (cmd == ION_IOC_CLEAN_CACHES) ? "Clean" : "Invalidate",
-            flush_data.fd, flush_data.handle, flush_data.vaddr,
-            flush_data.length);
-    int ret = ioctl(op_buf_ion_info[index].ion_device_fd, ION_IOC_CUSTOM, &custom_data);
-    if (ret < 0) {
-        DEBUG_PRINT_ERROR("Cache %s failed: %s\n",
-                (cmd == ION_IOC_CLEAN_CACHES) ? "Clean" : "Invalidate",
-                strerror(errno));
-        return OMX_ErrorUndefined;
+    for(unsigned int i=0; i<2; i++) {
+        int ret = ioctl(op_buf_ion_info[index].data_fd,
+                        DMA_BUF_IOCTL_SYNC, &dma_buf_sync_data[i]);
+        if (ret < 0) {
+            DEBUG_PRINT_ERROR("Cache %s failed: %s\n",
+                              (i==0) ? "START" : "END",
+                              strerror(errno));
+            return OMX_ErrorUndefined;
+        }
     }
+
     return OMX_ErrorNone;
 }
 
@@ -11834,7 +11862,7 @@ void omx_vdec::prefetchNewBuffers() {
             drv_ctx.op_buf.buffer_size, drv_ctx.op_buf.actualcount,
             drv_ctx.video_resolution.frame_width,
             drv_ctx.video_resolution.frame_height);
-    dec.cmd = V4L2_DEC_QCOM_CMD_RECONFIG_HINT;
+    dec.cmd = V4L2_QCOM_CMD_SESSION_CONTINUE;
     if (ioctl(drv_ctx.video_driver_fd, VIDIOC_DECODER_CMD, &dec)) {
         DEBUG_PRINT_ERROR("Buffer info cmd failed : %d\n", errno);
     } else {
@@ -11886,6 +11914,7 @@ void omx_vdec::prefetchNewBuffers() {
             return;
         }
 
+#if NEED_TO_REVISIT
         struct ion_custom_data *custom_data = (struct ion_custom_data*) malloc(sizeof(*custom_data));
         struct ion_prefetch_data *prefetch_data = (struct ion_prefetch_data*) malloc(sizeof(*prefetch_data));
         struct ion_prefetch_regions *regions = (struct ion_prefetch_regions*) malloc(sizeof(*regions));
@@ -11915,13 +11944,16 @@ void omx_vdec::prefetchNewBuffers() {
         if (rc) {
             DEBUG_PRINT_ERROR("Custom prefetch ioctl failed rc : %d, errno : %d\n", rc, errno);
         }
+#endif
 
 prefetch_exit:
         close(ion_fd);
+#if NEED_TO_REVISIT
         free(sizes);
         free(regions);
         free(prefetch_data);
         free(custom_data);
+#endif
     }
 }
 
